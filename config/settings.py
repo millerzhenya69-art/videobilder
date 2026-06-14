@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     brand_url: str = Field(default="https://atlantavpn.example", alias="BRAND_URL")
     cta_text: str = Field(default="Ссылка в шапке профиля", alias="CTA_TEXT")
 
-    video_width: int = Field(default=1080, alias="VIDEO_WIDTH")
-    video_height: int = Field(default=1920, alias="VIDEO_HEIGHT")
+    video_width: int = Field(default=720, alias="VIDEO_WIDTH")
+    video_height: int = Field(default=1280, alias="VIDEO_HEIGHT")
     min_duration_seconds: int = Field(default=15, alias="MIN_DURATION_SECONDS")
     max_duration_seconds: int = Field(default=25, alias="MAX_DURATION_SECONDS")
     # 30 fps достаточно для Reels/TikTok и экономит RAM при FFmpeg

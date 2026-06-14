@@ -252,25 +252,23 @@ class FFmpegRenderer:
 
         vf_bg = [f"scale={w}:{h}", self._b_geq(idx)] + stars + phone_frame + title + subf + ["format=yuv420p"]
 
-        tmp_bg = self.output_dir / f"_bg{sc.index}.mp4"
-        tmp_pv = self.output_dir / f"_pv{sc.index}.mp4"
+        # Один проход: фоновая графика через lavfi (input 0) + Pexels-видео (input 1)
+        # масштабируется и накладывается через overlay в единый filter_complex
+        filter_complex = (
+            f"[0:v]{','.join(vf_bg)}[bg];"
+            f"[1:v]scale={iw}:{ih},setsar=1,format=yuv420p[pv];"
+            f"[bg][pv]overlay={ix}:{iy}[v]"
+        )
         await self._run([
-            "ffmpeg","-y","-f","lavfi","-i",f"color=c=black:s={w}x{h}:r={fps}",
-            "-t",str(sc.duration),"-vf",",".join(vf_bg),"-an",str(tmp_bg),
-        ])
-        await self._run([
-            "ffmpeg","-y","-stream_loop","-1","-i",str(bg),
+            "ffmpeg","-y",
+            "-f","lavfi","-i",f"color=c=black:s={w}x{h}:r={fps}",
+            "-stream_loop","-1","-i",str(bg),
             "-t",str(sc.duration),
-            "-vf",f"scale={iw}:{ih},setsar=1,format=yuv420p",
-            "-an","-r",str(fps),str(tmp_pv),
+            "-filter_complex",filter_complex,
+            "-map","[v]",
+            "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p",
+            "-an",str(out),
         ])
-        await self._run([
-            "ffmpeg","-y","-i",str(tmp_bg),"-i",str(tmp_pv),
-            "-filter_complex",f"[0:v][1:v]overlay={ix}:{iy}[v]",
-            "-map","[v]","-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-an",str(out),
-        ])
-        tmp_bg.unlink(missing_ok=True)
-        tmp_pv.unlink(missing_ok=True)
 
     async def _b_final(self, sc, out: Path) -> None:
         w,h,fps = self.settings.video_width, self.settings.video_height, self.settings.fps
