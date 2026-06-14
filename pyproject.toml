@@ -1,0 +1,58 @@
+[project]
+name = "atlanta-vpn-video-bot"
+version = "0.1.0"
+description = "Telegram bot that generates vertical ad videos for AtlantaVPN."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.7,<4",
+    "aiohttp>=3.9,<4",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "python-dotenv>=1.0,<2",
+    "edge-tts>=6.1,<7",
+    "gTTS>=2.4,<3",
+    "aiosqlite>=0.20,<1",
+    "tenacity>=8.3,<9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5,<1",
+    "mypy>=1.10,<2",
+    "pytest>=8.2,<9",
+]
+
+[project.scripts]
+atlanta-vpn-bot = "bot.main:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "ANN"]
+ignore = ["ANN401", "ASYNC240", "E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+exclude = ["cache", "logs"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bot*", "config*", "services*", "video_generation*", "tts*", "subtitles*", "assets*", "templates*", "brand_assets*"]
+exclude = ["tests*", "cache*", "logs*"]
+
+[tool.setuptools.package-data]
+brand_assets = ["*.png", "*.jpg"]

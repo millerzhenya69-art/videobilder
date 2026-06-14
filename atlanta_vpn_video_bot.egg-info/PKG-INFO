@@ -1,0 +1,141 @@
+Metadata-Version: 2.4
+Name: atlanta-vpn-video-bot
+Version: 0.1.0
+Summary: Telegram bot that generates vertical ad videos for AtlantaVPN.
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: aiogram<4,>=3.7
+Requires-Dist: aiohttp<4,>=3.9
+Requires-Dist: pydantic<3,>=2.9
+Requires-Dist: pydantic-settings<3,>=2.6
+Requires-Dist: python-dotenv<2,>=1.0
+Requires-Dist: edge-tts<7,>=6.1
+Requires-Dist: gTTS<3,>=2.4
+Requires-Dist: aiosqlite<1,>=0.20
+Requires-Dist: tenacity<9,>=8.3
+Provides-Extra: dev
+Requires-Dist: ruff<1,>=0.5; extra == "dev"
+Requires-Dist: mypy<2,>=1.10; extra == "dev"
+Requires-Dist: pytest<9,>=8.2; extra == "dev"
+
+# AtlantaVPN Video Bot
+
+Production-oriented Telegram bot scaffold for automatic generation of vertical promotional videos for AtlantaVPN in TikTok, Instagram Reels, and YouTube Shorts format.
+
+## What it does
+
+- Accepts `/generate` in Telegram and returns an MP4 video, scenario text, publication copy, hashtags, and used assets.
+- Generates native Russian-language content through hooks, useful digital tips, security, service access, myth checks, and soft CTA blocks.
+- Uses aiogram 3.x, Python 3.12+, asynchronous services, SQLite history, structured logging, and FFmpeg rendering.
+- Includes 20 reusable content templates with random template selection and history-aware LLM prompting.
+- Supports multiple TTS backends via a provider interface. The default is Edge TTS; `silent` can be used for offline smoke tests.
+- Searches Pexels for reusable stock videos when `PEXELS_API_KEY` is configured; otherwise creates local generated placeholders and still renders a complete video.
+- Caches generated/downloaded assets under `assets/` and generated media under `cache/`.
+
+## Commands
+
+- `/generate` — create a new video with a random template.
+- `/generate тема ролика` — create a new video constrained by a topic.
+- `/templates` — list all templates.
+- `/history` — show recent generations.
+- `/settings` — show current user settings.
+- `/stats` — show generation statistics.
+- `voice male` / `voice female` — switch the default Russian TTS voice for the current user.
+
+## Architecture
+
+```text
+/bot                Telegram routers, formatting, access middleware
+/config             environment settings and logging
+/services           LLM, persistence, domain models, user settings
+/video_generation   FFmpeg rendering pipeline
+/tts                TTS provider interface and implementations
+/subtitles          ASS subtitle generation
+/assets             asset provider and local asset cache
+/templates          20 content templates
+/cache              generated videos, audio, SQLite database
+/logs               rotating application logs
+```
+
+## Requirements
+
+- Python 3.12+
+- FFmpeg available in `PATH`
+- Telegram bot token from BotFather
+- Optional: Gemini API key for LLM scenarios
+- Optional: Pexels API key for stock video search
+
+## Local run
+
+```bash
+cp .env.example .env
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+# edit .env and set TELEGRAM_BOT_TOKEN plus ALLOWED_USER_IDS
+atlanta-vpn-bot
+```
+
+If `GEMINI_API_KEY` is empty, the bot uses a deterministic fallback script generator. If Edge TTS cannot reach its service, rendering continues without voice.
+
+## Docker run
+
+```bash
+cp .env.example .env
+# edit .env
+docker compose up --build
+```
+
+## Environment variables
+
+See `.env.example` for all options. Important variables:
+
+- `TELEGRAM_BOT_TOKEN` — required to run the bot.
+- `ALLOWED_USER_IDS` — comma-separated Telegram IDs; empty means no access restriction.
+- `GEMINI_API_KEY` — enables Gemini-based LLM scenario generation.
+- `GEMINI_MODEL` — Gemini model name for scripts.
+- `DEFAULT_TTS_ENGINE` — `edge` or `silent`.
+- `PEXELS_API_KEY` — enables reusable stock video search and local caching.
+
+## Content and compliance notes
+
+The prompt and fallback generator avoid aggressive direct advertising and do not instruct users to break laws or bypass legal restrictions. For production campaigns, review generated scripts before publication and verify that downloaded third-party assets are licensed for your exact usage context.
+
+## Smoke test without Telegram
+
+```bash
+python - <<'PY'
+import asyncio
+from config.settings import get_settings
+from services.history import HistoryRepository
+from video_generation.pipeline import VideoGenerationPipeline
+
+async def main():
+    settings = get_settings()
+    settings.default_tts_engine = 'silent'
+    repo = HistoryRepository(settings.sqlite_path)
+    await repo.init()
+    result = await VideoGenerationPipeline(settings, repo).generate('публичный Wi-Fi')
+    print(result.video_path)
+
+asyncio.run(main())
+PY
+```
+
+## Локальный запуск (Windows)
+
+```powershell
+# Из корня проекта (НЕ из папки bot\)
+cd C:\Users\...\videobilder-main
+pip install -e .
+copy .env.example .env
+# Заполни .env токенами, затем:
+python run.py
+# Или:
+python -m bot.main
+```
+
+## Railway деплой
+1. Залей на GitHub
+2. Railway → New Project → GitHub repo
+3. Добавь переменные из .env.example в Railway Variables

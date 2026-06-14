@@ -1,0 +1,9 @@
+assets
+bot
+brand_assets
+config
+services
+subtitles
+templates
+tts
+video_generation

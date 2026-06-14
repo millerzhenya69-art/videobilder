@@ -1,0 +1,12 @@
+[phases.setup]
+nixPkgs = ["ffmpeg", "python312", "fontconfig"]
+
+[phases.install]
+cmds = [
+    "pip install --upgrade pip",
+    "pip install .",
+    "mkdir -p cache/videos cache/audio logs assets/downloaded assets/generated"
+]
+
+[start]
+cmd = "atlanta-vpn-bot"
