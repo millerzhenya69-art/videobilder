@@ -3,7 +3,6 @@
 Генерирует badge.png из логотипа.
 """
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
 
 ASSETS_DIR = Path(__file__).parent
 
@@ -11,6 +10,8 @@ def make_badge(out_path: Path | None = None) -> Path:
     out_path = out_path or ASSETS_DIR / "badge.png"
     if out_path.exists():
         return out_path
+
+    from PIL import Image, ImageDraw, ImageFont
 
     badge_w, badge_h = 320, 70
     badge = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))
