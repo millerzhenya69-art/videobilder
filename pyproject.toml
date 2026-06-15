@@ -14,6 +14,7 @@ dependencies = [
     "gTTS>=2.4,<3",
     "aiosqlite>=0.20,<1",
     "tenacity>=8.3,<9",
+    "Pillow>=10.0,<12",
 ]
 
 [project.optional-dependencies]
