@@ -51,12 +51,27 @@ class AssetProvider:
                 videos = data.get("videos") or []
                 if not videos:
                     return None
-                files = sorted(videos[0].get("video_files", []), key=lambda item: item.get("width", 0), reverse=True)
-                link = next((item.get("link") for item in files if item.get("link")), None)
+                files = videos[0].get("video_files", [])
+                target_w = self.settings.video_width
+                # Выбираем файл с шириной БЛИЖЕ к нашему target (но не меньше),
+                # чтобы избежать decode огромных 1080p/4K видео -> OOM на 512MB.
+                # Сначала кандидаты >= target_w, среди них минимальный по ширине.
+                candidates = [f for f in files if f.get("width", 0) >= target_w]
+                if candidates:
+                    best = min(candidates, key=lambda f: f.get("width", 0))
+                else:
+                    # Если все файлы меньше target_w — берём самый большой из доступных
+                    best = max(files, key=lambda f: f.get("width", 0), default=None)
+                link = best.get("link") if best else None
                 if not link:
                     return None
                 async with session.get(link) as media_resp:
                     if media_resp.status != 200:
+                        return None
+                    content_length = media_resp.headers.get("Content-Length")
+                    # Safety cap: skip files over 25MB to avoid memory issues during ffmpeg decode
+                    if content_length and int(content_length) > 25 * 1024 * 1024:
+                        logger.warning("Pexels video too large (%s bytes), skipping", content_length)
                         return None
                     target.write_bytes(await media_resp.read())
                 return Asset(path=target, source_url=link, license="Pexels License", kind="video", keywords=keywords)
