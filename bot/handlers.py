@@ -1,8 +1,26 @@
+"""
+handlers.py — исправленная логика выбора шаблона.
+
+Баг: при свободном тексте бот показывал кнопки шаблона
+И тут же сразу генерировал без ожидания нажатия.
+
+Фикс: при свободном тексте — ТОЛЬКО показываем кнопки и сохраняем тему
+в callback_data. Генерация запускается ТОЛЬКО после нажатия кнопки.
+
+Тема передаётся через callback_data: "style:dark_planet:тема"
+"""
 import logging
+import urllib.parse
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import FSInputFile, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from services.history import HistoryRepository
 from services.settings_store import SettingsStore
@@ -16,21 +34,36 @@ settings_store = SettingsStore()
 HELP_TEXT = (
     "🎬 <b>AtlantaVPN Video Bot</b>\n\n"
     "<b>Команды:</b>\n"
-    "• /generate — видео (авто-тема, чередование шаблонов)\n"
+    "• /generate — видео (авто-тема)\n"
     "• /generate [тема] — видео по теме:\n"
     "  <code>/generate публичный wifi опасен</code>\n"
     "• /a [тема] — шаблон A (тёмный + синяя планета)\n"
     "• /b [тема] — шаблон B (фиолетовый + телефон)\n"
     "• /templates — список шаблонов\n"
     "• /history — последние генерации\n\n"
-    "💡 Или просто напиши тему — сделаю видео!"
+    "💡 Или просто напиши тему — выберешь шаблон и я сделаю видео!"
 )
 
+# Максимальная длина темы в callback_data (Telegram лимит 64 байт на весь data)
+_MAX_TOPIC_IN_CB = 40
 
-def _style_keyboard() -> InlineKeyboardMarkup:
+
+def _style_keyboard(topic: str | None = None) -> InlineKeyboardMarkup:
+    """Кнопки выбора шаблона. Тема кодируется в callback_data."""
+    topic_part = ""
+    if topic:
+        # URL-encode чтобы не сломать разбор по ":"
+        encoded = urllib.parse.quote(topic[:_MAX_TOPIC_IN_CB], safe="")
+        topic_part = f":{encoded}"
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🌑 Шаблон A", callback_data="style:dark_planet"),
-        InlineKeyboardButton(text="🟣 Шаблон B", callback_data="style:gradient_phone"),
+        InlineKeyboardButton(
+            text="🌑 Шаблон A",
+            callback_data=f"style:dark_planet{topic_part}",
+        ),
+        InlineKeyboardButton(
+            text="🟣 Шаблон B",
+            callback_data=f"style:gradient_phone{topic_part}",
+        ),
     ]])
 
 
@@ -45,28 +78,37 @@ async def help_cmd(message: Message) -> None:
 
 
 @router.message(Command("generate"))
-async def generate(message: Message, command: CommandObject,
-                   pipeline: VideoGenerationPipeline) -> None:
+async def generate(
+    message: Message,
+    command: CommandObject,
+    pipeline: VideoGenerationPipeline,
+) -> None:
     topic = command.args.strip() if command.args else None
     await _do_generate(message, pipeline, topic, visual_style=None)
 
 
 @router.message(Command("a"))
-async def generate_a(message: Message, command: CommandObject,
-                     pipeline: VideoGenerationPipeline) -> None:
+async def generate_a(
+    message: Message,
+    command: CommandObject,
+    pipeline: VideoGenerationPipeline,
+) -> None:
     topic = command.args.strip() if command.args else None
     await _do_generate(message, pipeline, topic, visual_style="dark_planet")
 
 
 @router.message(Command("b"))
-async def generate_b(message: Message, command: CommandObject,
-                     pipeline: VideoGenerationPipeline) -> None:
+async def generate_b(
+    message: Message,
+    command: CommandObject,
+    pipeline: VideoGenerationPipeline,
+) -> None:
     topic = command.args.strip() if command.args else None
     await _do_generate(message, pipeline, topic, visual_style="gradient_phone")
 
 
 @router.message(Command("templates"))
-async def templates(message: Message) -> None:
+async def templates_cmd(message: Message) -> None:
     text = "<b>Шаблоны сценариев:</b>\n" + "\n".join(
         f"• <code>{t.id}</code> — {t.name}: {t.angle}" for t in TEMPLATES
     )
@@ -74,7 +116,7 @@ async def templates(message: Message) -> None:
 
 
 @router.message(Command("history"))
-async def history(message: Message, history_repo: HistoryRepository) -> None:
+async def history_cmd(message: Message, history_repo: HistoryRepository) -> None:
     rows = await history_repo.latest(limit=10)
     if not rows:
         await message.answer("История пустая — создай первое видео командой /generate")
@@ -86,27 +128,50 @@ async def history(message: Message, history_repo: HistoryRepository) -> None:
 
 
 @router.callback_query(F.data.startswith("style:"))
-async def style_callback(callback: CallbackQuery,
-                          pipeline: VideoGenerationPipeline) -> None:
-    style = callback.data.split(":", 1)[1]
+async def style_callback(
+    callback: CallbackQuery,
+    pipeline: VideoGenerationPipeline,
+) -> None:
+    """
+    Обрабатывает нажатие кнопки выбора шаблона.
+    callback_data формат: "style:<visual_style>" или "style:<visual_style>:<encoded_topic>"
+    """
     await callback.answer()
-    await _do_generate(callback.message, pipeline, topic=None, visual_style=style)
+
+    parts = callback.data.split(":", 2)
+    visual_style = parts[1] if len(parts) > 1 else "dark_planet"
+    topic: str | None = None
+    if len(parts) > 2:
+        try:
+            topic = urllib.parse.unquote(parts[2])
+        except Exception:
+            topic = None
+
+    # Убираем кнопки из исходного сообщения
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await _do_generate(callback.message, pipeline, topic=topic, visual_style=visual_style)
 
 
 @router.message(F.text & ~F.text.startswith("/"))
-async def free_text(message: Message, pipeline: VideoGenerationPipeline) -> None:
+async def free_text(message: Message) -> None:
+    """
+    Свободный текст — показываем кнопки выбора шаблона.
+    Генерация НЕ запускается здесь — только после нажатия кнопки.
+    """
     topic = message.text.strip() if message.text else None
-    if not topic or len(topic) < 3:
+    if not topic or len(topic) < 2:
         await message.answer(HELP_TEXT, parse_mode="HTML")
         return
-    # Показываем кнопки выбора шаблона
+
     await message.answer(
-        f"🎬 Тема: <i>{topic}</i>\nКакой шаблон использовать?",
+        f"🎬 Тема: <i>{topic}</i>\n\nКакой шаблон использовать?",
         parse_mode="HTML",
-        reply_markup=_style_keyboard(),
+        reply_markup=_style_keyboard(topic),
     )
-    # Сохраняем тему в данные callback через pipeline (упрощённо — генерируем сразу auto)
-    await _do_generate(message, pipeline, topic, visual_style=None)
 
 
 async def _do_generate(
@@ -115,7 +180,11 @@ async def _do_generate(
     topic: str | None,
     visual_style: str | None,
 ) -> None:
-    style_label = {"dark_planet": "🌑 A", "gradient_phone": "🟣 B"}.get(visual_style or "", "🔀 авто")
+    style_label = {
+        "dark_planet": "🌑 A (тёмный)",
+        "gradient_phone": "🟣 B (фиолетовый)",
+    }.get(visual_style or "", "🔀 авто")
+
     topic_str = f" — <i>{topic}</i>" if topic else ""
     status = await message.answer(
         f"⏳ Генерирую видео {style_label}{topic_str}\n"
