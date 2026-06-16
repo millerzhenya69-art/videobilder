@@ -177,6 +177,31 @@ class ScriptGenerator:
 
     def _fallback_script(self, template: VideoTemplate, topic: str | None) -> VideoScript:
         rng = SystemRandom()
+        # Если topic выглядит как template_id (нет пробелов, содержит _)
+        # — заменяем на человекочитаемую тему
+        _template_to_topic = {
+            "digital_safety": "публичный Wi-Fi",
+            "gaming_ping": "пинг в играх",
+            "family_security": "безопасность семьи",
+            "privacy_story": "приватность в сети",
+            "work_remote": "удалённая работа",
+            "speed_test": "скорость интернета",
+            "blocked_news": "заблокированные сайты",
+            "public_wifi": "публичный Wi-Fi",
+            "travel_tip": "интернет в путешествии",
+            "subscription_save": "сервисы за рубежом",
+            "hidden_setting": "настройки смартфона",
+            "anti_tracking": "слежка в интернете",
+            "student_lifehack": "учёба онлайн",
+            "creator_stack": "работа контент-мейкера",
+            "weekly_checklist": "цифровая безопасность",
+            "browser_error": "ошибки браузера",
+            "three_sites": "полезные сайты",
+            "one_minute_setup": "быстрая настройка VPN",
+        }
+        if topic and "_" in topic and " " not in topic:
+            topic = _template_to_topic.get(topic, topic.replace("_", " "))
+
         subject = topic or rng.choice(
             ["публичный Wi-Fi", "потоковые сервисы", "приватность в сети", "работа за рубежом"]
         )
