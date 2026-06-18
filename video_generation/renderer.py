@@ -1,13 +1,14 @@
 """
-FFmpegRenderer v7 — оптимизированный под Render 512MB / free tier.
+FFmpegRenderer v8 — визуальные фиксы layout.
 
-Изменения vs v6:
-  • -threads 1 во всех encode-командах    → нет параллельных потоков x264
-  • -preset ultrafast для сегментов       → минимальный lookahead-буфер (~30MB → ~5MB)
-  • -preset veryfast только в _mix        → сохраняем приемлемое качество финала
-  • stderr ограничен: proc.communicate()  → безопасный read без OOM
-  • cleanup сегментов после concat        → освобождаем FS после сборки
-  • _run принимает timeout=300            → защита от зависшего ffmpeg
+Изменения vs v7:
+  • _b_phone: tsy считается от нижнего края badge, не h*0.08
+    → заголовок больше не залезает на бейдж
+  • _b_phone: subf y=h*0.80 → y=h*0.795 (чуть выше, запас от края)
+  • _b_final: лого и текст перерисованы как единый центрированный блок
+    → иконка-щит слева + "Atlanta VPN" справа, всё по центру экрана
+  • _b_final: CTA text поднят до h*0.70 (было h*0.62 — слишком высоко
+    относительно логоблока в центре)
 """
 from __future__ import annotations
 
@@ -308,10 +309,16 @@ class FFmpegRenderer:
             f"drawbox=x={(w-56)//2}:y={py+6}:w=56:h=14:color=0x0d0d1a:t=fill",
         ]
         badge       = self._badge_drawtext(f, h)
-        sz          = 74 if hook else 66
+        sz          = 72 if hook else 64
         tlines      = _wrap(sc.on_screen_text, 18)
         tlh         = sz + 10
-        tsy         = int(h * 0.08)
+        # tsy: размещаем заголовок НИЖЕ badge, не поверх него.
+        # badge занимает y=int(h*0.07)..+56px; добавляем зазор 10px.
+        _badge_bottom = int(h * 0.07) + 56 + 10   # ≈ 155px при h=1280
+        _phone_top    = py - 10                     # ≈ 297px
+        _zone_h       = _phone_top - _badge_bottom  # ≈ 142px
+        _block_h      = len(tlines) * tlh - 10
+        tsy = _badge_bottom + max(0, (_zone_h - _block_h) // 2)
         title       = [
             f"drawtext={f}fontcolor=white:fontsize={sz}:borderw=3:bordercolor=black@0.3:"
             f"x=(w-text_w)/2:y={tsy+i*tlh}:text='{_esc(l)}'"
@@ -319,8 +326,8 @@ class FFmpegRenderer:
         ]
         sub  = _esc(sc.voiceover[:45]) if sc.voiceover else ""
         subf = (
-            [f"drawtext={f}fontcolor=0xE0D0FF:fontsize=46:borderw=2:bordercolor=black@0.3:"
-             f"x=(w-text_w)/2:y=h*0.80:text='{sub}'"]
+            [f"drawtext={f}fontcolor=0xE0D0FF:fontsize=44:borderw=2:bordercolor=black@0.3:"
+             f"x=(w-text_w)/2:y=h*0.795:text='{sub}'"]
             if sub else []
         )
 
@@ -351,15 +358,28 @@ class FFmpegRenderer:
         f         = self._fa()
         stars     = _stars(w, h, seed=99, count=18)
         badge     = self._badge_drawtext(f, h)
+        # Лого-блок: иконка-щит + текст "Atlanta VPN" как единый горизонтальный блок.
+        # Общая ширина блока: icon(72) + gap(16) + text(~310) ≈ 398px → блок 400px.
+        # Центрируем весь блок: bx = (w - 400) // 2 = 160.
+        bx      = (w - 400) // 2          # 160
+        icon_cy = h // 2 - 80             # вертикальный центр иконки
+        icon_y  = icon_cy - 36            # верх квадрата 72px
+        text_y  = icon_cy - 35            # baseline текста ~вровень с иконкой
         logo      = [
-            f"drawbox=x={(w-400)//2}:y={(h-90)//2-10}:w=72:h=72:color=0x0055cc@0.9:t=fill",
-            f"drawtext={f}fontcolor=white:fontsize=70:borderw=3:bordercolor=0x003080@0.4:"
-            f"x=(w-text_w)/2+45:y=(h-text_h)/2:text='Atlanta VPN'",
+            # Иконка-щит (синий квадрат)
+            f"drawbox=x={bx}:y={icon_y}:w=72:h=72:color=0x0055cc@0.92:t=fill",
+            # Буква «A» как символ внутри иконки
+            f"drawtext={f}fontcolor=white:fontsize=48:borderw=2:bordercolor=0x003080@0.6:"
+            f"x={bx+14}:y={icon_y+12}:text='A'",
+            # Текст «Atlanta VPN» справа от иконки
+            f"drawtext={f}fontcolor=white:fontsize=64:borderw=3:bordercolor=0x003080@0.4:"
+            f"x={bx+88}:y={text_y}:text='Atlanta VPN'",
         ]
         ct  = _esc(sc.on_screen_text)
         cta = [
-            f"drawtext={f}fontcolor=0xD0C0FF:fontsize=52:borderw=2:bordercolor=black@0.3:"
-            f"x=(w-text_w)/2:y=h*0.62:text='{ct}'"
+            # CTA под лого-блоком с зазором
+            f"drawtext={f}fontcolor=0xD0C0FF:fontsize=50:borderw=2:bordercolor=black@0.3:"
+            f"x=(w-text_w)/2:y=h*0.70:text='{ct}'"
         ]
         vf = [f"scale={w}:{h}"] + stars + badge + logo + cta + ["format=yuv420p"]
         await self._run([
