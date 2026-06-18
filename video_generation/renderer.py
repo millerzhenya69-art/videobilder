@@ -1,14 +1,16 @@
 """
-FFmpegRenderer v8 — визуальные фиксы layout.
+FFmpegRenderer v9 — брендовые ассеты AtlantaVPN.
 
-Изменения vs v7:
-  • _b_phone: tsy считается от нижнего края badge, не h*0.08
-    → заголовок больше не залезает на бейдж
-  • _b_phone: subf y=h*0.80 → y=h*0.795 (чуть выше, запас от края)
-  • _b_final: лого и текст перерисованы как единый центрированный блок
-    → иконка-щит слева + "Atlanta VPN" справа, всё по центру экрана
-  • _b_final: CTA text поднят до h*0.70 (было h*0.62 — слишком высоко
-    относительно логоблока в центре)
+Изменения vs v8:
+  • Реальный badge через movie= filter (PNG с прозрачностью из /tmp/atlanta_badge.png)
+    Fallback на drawtext если badge недоступен
+  • Новый метод _badge_overlay() — встраивает badge через filter_complex
+  • Шаблон A (_a_video, _a_solid): badge через overlay, текст ниже badge
+  • Финальный слайд: использует IMG_5778.MP4 (официальный CTA-ролик)
+    если файл доступен в brand_assets/; иначе сгенерированный
+  • Текст заголовков: уменьшен и обёрнут жёстче (12 симв.) → нет обрезки справа
+  • Sub-текст: fontsize 40 (было 46) + truncate 42 симв. → влезает целиком
+  • Все encode-флаги сохранены из v8 (ultrafast для сегментов, veryfast для mix)
 """
 from __future__ import annotations
 
@@ -40,22 +42,36 @@ _B_BG = [
     ("0x2a0a70", "0x7c3aed"),
 ]
 
-# Флаги кодировщика для сегментов (RAM важнее качества промежуточных клипов)
+# Ищем официальный CTA-ролик для финального слайда
+_BRAND_ASSETS_DIR = Path(__file__).parent.parent / "brand_assets"
+_OFFICIAL_CTA_NAMES = ["IMG_5778.MP4", "img_5778.mp4", "cta_final.mp4", "official_cta.mp4"]
+
 _SEG_ENCODE = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                "-threads", "1", "-pix_fmt", "yuv420p"]
-
-# Флаги кодировщика для финального mix (качество важнее)
 _MIX_ENCODE = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                "-threads", "1", "-pix_fmt", "yuv420p"]
+
+# Путь к badge (ASCII, для ffmpeg movie= filter)
+_BADGE_TMP = Path("/tmp/atlanta_badge.png")
 
 
 class FFmpegRenderer:
     def __init__(self, settings: Settings) -> None:
-        self.settings   = settings
-        self.output_dir = settings.cache_dir / "videos"
+        self.settings    = settings
+        self.output_dir  = settings.cache_dir / "videos"
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._font      = self._find_font()
+        self._font       = self._find_font()
         self._badge_path: Path | None = None
+        self._cta_video:  Path | None = self._find_cta_video()
+
+    def _find_cta_video(self) -> Path | None:
+        """Ищем официальный CTA-ролик в brand_assets/."""
+        for name in _OFFICIAL_CTA_NAMES:
+            p = _BRAND_ASSETS_DIR / name
+            if p.exists() and p.stat().st_size > 10_000:
+                logger.info("Official CTA video found: %s", p)
+                return p
+        return None
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -72,9 +88,13 @@ class FFmpegRenderer:
         subtitle_path = self.output_dir / f"{target.stem}.ass"
         write_ass(build_cues(script.scenes), subtitle_path)
 
+        # Подготавливаем badge (реальный логотип)
         try:
             self._badge_path = make_badge()
-        except Exception:
+            if not (self._badge_path.exists() and self._badge_path.stat().st_size > 500):
+                self._badge_path = None
+        except Exception as e:
+            logger.warning("Badge generation failed: %s", e)
             self._badge_path = None
 
         video_assets: dict[int, Path] = {
@@ -94,14 +114,10 @@ class FFmpegRenderer:
         concat = self.output_dir / f"{target.stem}_concat.txt"
         concat.write_text("".join(f"file '{p.resolve()}'\n" for p in clips), encoding="utf-8")
         await self._mix(concat, voice_path, target)
-
-        # Cleanup: удаляем временные сегменты и concat-файл после финального mix
         self._cleanup_segments(clips, concat)
-
         return target, subtitle_path
 
     def _cleanup_segments(self, clips: list[Path], concat: Path) -> None:
-        """Удаляем временные сегменты после успешной сборки."""
         for clip in clips:
             try:
                 if clip.exists():
@@ -112,8 +128,47 @@ class FFmpegRenderer:
             if concat.exists():
                 concat.unlink()
         except Exception as e:
-            logger.warning("Could not delete concat file: %s", e)
+            logger.warning("Could not delete concat: %s", e)
         gc.collect()
+
+    # ── Badge helpers ─────────────────────────────────────────────────────────
+
+    def _badge_overlay_fc(self, base_label: str, out_label: str, w: int, h: int) -> str:
+        """
+        filter_complex фрагмент для overlay badge PNG поверх [base_label].
+        Использует movie= source (не доп. input) → не меняет нумерацию inputs.
+        Возвращает строку для вставки в filter_complex.
+        """
+        if not self._badge_path:
+            return ""
+        bw, bh = 280, 56
+        bx = (w - bw) // 2
+        by = int(h * 0.07)
+        esc = str(self._badge_path).replace("'", "\\'")
+        return (
+            f"movie='{esc}',scale={bw}:{bh},format=yuva420p[badge_img];"
+            f"[{base_label}][badge_img]overlay={bx}:{by}[{out_label}]"
+        )
+
+    def _badge_drawtext(self, f: str, h: int) -> list[str]:
+        """Текстовый fallback для badge в простом -vf пайплайне."""
+        by = int(h * 0.07)
+        bw, bh_v = 280, 56
+        return [
+            f"drawbox=x=(w-{bw})/2:y={by}:w={bw}:h={bh_v}:color=0x003799@0.92:t=fill",
+            f"drawtext={f}fontcolor=white:fontsize=32:borderw=1:bordercolor=0x002060@0.6:"
+            f"x=(w-text_w)/2:y={by+13}:text='Atlanta VPN'",
+        ]
+
+    def _badge_fc_or_drawtext(self, f: str, h: int, w: int,
+                               vf_filters: list[str]) -> tuple[list[str], str | None]:
+        """
+        Возвращает (vf_filters_с_badge, None) если badge через drawtext,
+        или (vf_filters_без_badge, fc_fragment) если через movie overlay.
+        """
+        if self._badge_path:
+            return vf_filters, self._badge_overlay_fc("base", "out", w, h)
+        return vf_filters + self._badge_drawtext(f, h), None
 
     # ── Шаблон A ──────────────────────────────────────────────────────────────
 
@@ -122,120 +177,160 @@ class FFmpegRenderer:
         clips = []
         for i, sc in enumerate(script.scenes):
             out = self.output_dir / f"a{sc.index}_{script.template_id}.mp4"
-            bg  = va.get(sc.index)
-            await (self._a_video(sc, bg, out, i == 0, i == n-1)
-                   if bg else
-                   self._a_solid(sc, out, i == 0, i == n-1))
+
+            # Последний слайд — официальный CTA если есть
+            is_last = (i == n - 1)
+            if is_last and self._cta_video:
+                await self._a_cta_official(sc, out)
+            else:
+                bg = va.get(sc.index)
+                await (self._a_video(sc, bg, out, i == 0, is_last)
+                       if bg else
+                       self._a_solid(sc, out, i == 0, is_last))
             clips.append(out)
-            gc.collect()  # освобождаем память после каждого сегмента
+            gc.collect()
         return clips
-
-    def _badge_filter(self, w: int, h: int) -> list[str]:
-        if not self._badge_path:
-            return []
-        bw, bh = 320, 70
-        bx = (w - bw) // 2
-        by = int(h * 0.07)
-        esc_path = str(self._badge_path).replace("\\", "/").replace("'", "\\'").replace(":", "\\:")
-        return [f"movie='{esc_path}',scale={bw}:{bh}[badge];[in][badge]overlay={bx}:{by}[out]"]
-
-    def _badge_drawtext(self, f: str, h: int) -> list[str]:
-        by = int(h * 0.07)
-        bw, bh_v = 280, 56
-        return [
-            f"drawbox=x=(w-{bw})/2:y={by}:w={bw}:h={bh_v}:color=0x0055aa@0.88:t=fill",
-            f"drawtext={f}fontcolor=white:fontsize=34:borderw=2:bordercolor=0x003090@0.5:"
-            f"x=(w-text_w)/2:y={by+11}:text='Atlanta VPN'",
-        ]
 
     async def _a_solid(self, sc, out: Path, hook: bool, cta: bool) -> None:
         w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
-        idx        = (sc.index - 1) % len(_A_BG)
-        bg_color   = _A_BG[idx][0]
-        f          = self._fa()
+        idx      = (sc.index - 1) % len(_A_BG)
+        bg_color = _A_BG[idx][0]
+        f        = self._fa()
 
         planet = _planet_boxes(w, h)
         grid = (
             [f"drawbox=x=0:y={h*i//6}:w={w}:h=1:color=0x1a2a3a@0.2:t=fill" for i in range(1, 6)]
             + [f"drawbox=x={w*i//4}:y=0:w=1:h={h}:color=0x1a2a3a@0.2:t=fill" for i in range(1, 4)]
         )
-        badge = self._badge_drawtext(f, h)
+        # badge и текст позиционируем ниже badge
+        badge_bottom = int(h * 0.07) + 56 + 8   # ≈153
+        sz    = 82 if hook else 72
+        lines = _wrap(sc.on_screen_text.upper(), 12)  # жёстче оборот — нет обрезки
+        lh    = sz + 10
+        sy    = badge_bottom + 16
 
-        sz    = 86 if hook else 78
-        yf    = 0.26 if hook else 0.30
-        lines = _wrap(sc.on_screen_text.upper(), 14)
-        lh    = sz + 12
-        sy    = int(h * yf) - len(lines) * lh // 2
         title = [
             f"drawtext={f}fontcolor=white:fontsize={sz}:borderw=4:bordercolor=black@0.7:"
             f"x=(w-text_w)/2:y={sy+i*lh}:text='{_esc(l)}'"
             for i, l in enumerate(lines)
         ]
-
-        sub = _esc(sc.voiceover[:55]) if sc.voiceover and not cta else ""
+        sub = _esc(sc.voiceover[:42]) if sc.voiceover and not cta else ""
         sub_f = (
-            [f"drawtext={f}fontcolor=0xB0C8E0:fontsize=46:borderw=3:bordercolor=black@0.5:"
-             f"x=(w-text_w)/2:y=h*0.68:text='{sub}'"]
+            [f"drawtext={f}fontcolor=0xB0C8E0:fontsize=40:borderw=2:bordercolor=black@0.5:"
+             f"x=(w-text_w)/2:y=h*0.71:text='{sub}'"]
             if sub else []
         )
         cta_f = []
         if cta:
             ct = _esc("Ссылка в описании")
             cta_f = [
-                f"drawbox=x=(w-480)/2:y=h*0.72:w=480:h=64:color=0x003070@0.75:t=fill",
-                f"drawtext={f}fontcolor=white:fontsize=42:borderw=2:bordercolor=black@0.4:"
-                f"x=(w-text_w)/2:y=h*0.737:text='{ct}'",
+                f"drawbox=x=(w-460)/2:y=h*0.74:w=460:h=60:color=0x003070@0.75:t=fill",
+                f"drawtext={f}fontcolor=white:fontsize=40:borderw=2:bordercolor=black@0.4:"
+                f"x=(w-text_w)/2:y=h*0.757:text='{ct}'",
             ]
 
-        vf = (
-            [f"scale={w}:{h}"]
-            + planet + grid + badge + title + sub_f + cta_f
-            + ["format=yuv420p"]
+        vf_base = (
+            [f"scale={w}:{h}"] + planet + grid + title + sub_f + cta_f + ["format=yuv420p"]
         )
 
-        await self._run([
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
-            "-t", str(sc.duration),
-            "-vf", ",".join(vf),
-            "-an",
-        ] + _SEG_ENCODE + [str(out)])
+        if self._badge_path:
+            # badge через movie= overlay в filter_complex
+            bw, bh_val = 280, 56
+            bx = (w - bw) // 2
+            by = int(h * 0.07)
+            esc_badge = str(self._badge_path).replace("'", "\\'")
+            fc = (
+                f"[0:v]{','.join(vf_base[:-1])}[base];"
+                f"movie='{esc_badge}',scale={bw}:{bh_val},format=yuva420p[bdg];"
+                f"[base][bdg]overlay={bx}:{by},format=yuv420p[v]"
+            )
+            await self._run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
+                "-t", str(sc.duration),
+                "-filter_complex", fc, "-map", "[v]", "-an",
+            ] + _SEG_ENCODE + [str(out)])
+        else:
+            badge_filters = self._badge_drawtext(f, h)
+            vf = [f"scale={w}:{h}"] + planet + grid + badge_filters + title + sub_f + cta_f + ["format=yuv420p"]
+            await self._run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
+                "-t", str(sc.duration), "-vf", ",".join(vf), "-an",
+            ] + _SEG_ENCODE + [str(out)])
 
     async def _a_video(self, sc, bg: Path, out: Path, hook: bool, cta: bool) -> None:
         w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
         f         = self._fa()
 
-        sz    = 100 if hook else 88
-        lines = _wrap(sc.on_screen_text.upper(), 14)
-        lh    = sz + 12
-        sy    = int(h * 0.33) - len(lines) * lh // 2
-        sub   = _esc(sc.voiceover[:55]) if sc.voiceover else ""
+        badge_bottom = int(h * 0.07) + 56 + 8
+        sz    = 90 if hook else 80
+        lines = _wrap(sc.on_screen_text.upper(), 12)
+        lh    = sz + 10
+        sy    = badge_bottom + 16
 
         title_f = [
             f"drawtext={f}fontcolor=white:fontsize={sz}:borderw=5:bordercolor=black@0.8:"
             f"x=(w-text_w)/2:y={sy+i*lh}:text='{_esc(l)}'"
             for i, l in enumerate(lines)
         ]
+        sub = _esc(sc.voiceover[:42]) if sc.voiceover else ""
         sub_f = (
-            [f"drawtext={f}fontcolor=0xB0C8E0:fontsize=46:borderw=3:bordercolor=black@0.5:"
-             f"x=(w-text_w)/2:y=h*0.68:text='{sub}'"]
+            [f"drawtext={f}fontcolor=0xB0C8E0:fontsize=40:borderw=3:bordercolor=black@0.5:"
+             f"x=(w-text_w)/2:y=h*0.71:text='{sub}'"]
             if sub else []
         )
-        badge_f = self._badge_drawtext(f, h)
 
-        vf = (
+        vf_base = (
             [f"scale={w}:{h},crop={w}:{h}:(iw-{w})/2:(ih-{h})/2",
              "colorchannelmixer=rr=0.30:gg=0.30:bb=0.38"]
-            + badge_f + title_f + sub_f
-            + ["format=yuv420p"]
+            + title_f + sub_f
         )
 
+        if self._badge_path:
+            bw, bh_val = 280, 56
+            bx = (w - bw) // 2
+            by = int(h * 0.07)
+            esc_badge = str(self._badge_path).replace("'", "\\'")
+            fc = (
+                f"[0:v]{','.join(vf_base)}[base];"
+                f"movie='{esc_badge}',scale={bw}:{bh_val},format=yuva420p[bdg];"
+                f"[base][bdg]overlay={bx}:{by},format=yuv420p[v]"
+            )
+            await self._run([
+                "ffmpeg", "-y",
+                "-stream_loop", "-1", "-i", str(bg),
+                "-t", str(sc.duration),
+                "-filter_complex", fc, "-map", "[v]", "-an", "-r", str(fps),
+            ] + _SEG_ENCODE + [str(out)])
+        else:
+            badge_f = self._badge_drawtext(f, h)
+            vf = vf_base + badge_f + ["format=yuv420p"]
+            await self._run([
+                "ffmpeg", "-y",
+                "-stream_loop", "-1", "-i", str(bg),
+                "-t", str(sc.duration),
+                "-vf", ",".join(vf), "-an", "-r", str(fps),
+            ] + _SEG_ENCODE + [str(out)])
+
+    async def _a_cta_official(self, sc, out: Path) -> None:
+        """
+        Финальный слайд: официальный CTA-ролик IMG_5778.MP4.
+        640x432 горизонтальное → pad до 720x1280 (чёрные полосы сверху/снизу).
+        Длина = длина сцены или длина ролика (берём меньшее).
+        """
+        w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
+        duration = min(sc.duration, 5.8)  # IMG_5778 = 5.8с
         await self._run([
             "ffmpeg", "-y",
-            "-stream_loop", "-1", "-i", str(bg),
-            "-t", str(sc.duration),
-            "-vf", ",".join(vf),
-            "-an", "-r", str(fps),
+            "-stream_loop", "-1", "-i", str(self._cta_video),
+            "-t", str(duration),
+            "-vf", (
+                f"scale={w}:-2:force_original_aspect_ratio=decrease,"
+                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,"
+                f"setsar=1,format=yuv420p"
+            ),
+            "-an",
         ] + _SEG_ENCODE + [str(out)])
 
     # ── Шаблон B ──────────────────────────────────────────────────────────────
@@ -246,7 +341,10 @@ class FFmpegRenderer:
         for i, sc in enumerate(script.scenes):
             out = self.output_dir / f"b{sc.index}_{script.template_id}.mp4"
             bg  = va.get(sc.index)
-            if i == n - 1:
+            is_last = (i == n - 1)
+            if is_last and self._cta_video:
+                await self._a_cta_official(sc, out)
+            elif is_last:
                 await self._b_final(sc, out)
             elif bg:
                 await self._b_phone(sc, bg, out, i == 0)
@@ -261,40 +359,58 @@ class FFmpegRenderer:
 
     async def _b_text(self, sc, out: Path, hook: bool) -> None:
         w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
-        idx       = (sc.index - 1) % len(_B_BG)
-        bg_color  = self._b_bg_color(idx)
-        f         = self._fa()
-        stars     = _stars(w, h, sc.index)
-        badge     = self._badge_drawtext(f, h)
+        idx      = (sc.index - 1) % len(_B_BG)
+        bg_color = self._b_bg_color(idx)
+        f        = self._fa()
+        stars    = _stars(w, h, sc.index)
 
-        sz      = 96 if hook else 84
-        lines   = _wrap(sc.on_screen_text, 12)
-        lh      = sz + 14
-        ty      = (h - len(lines) * lh) // 2 - 40
-        title   = [
+        sz    = 90 if hook else 80
+        lines = _wrap(sc.on_screen_text, 11)
+        lh    = sz + 14
+        ty    = (h - len(lines) * lh) // 2 - 40
+        title = [
             f"drawtext={f}fontcolor=white:fontsize={sz}:borderw=3:bordercolor=black@0.3:"
             f"x=(w-text_w)/2:y={ty+i*lh}:text='{_esc(l)}'"
             for i, l in enumerate(lines)
         ]
-        sub  = _esc(sc.voiceover[:50]) if sc.voiceover else ""
+        sub  = _esc(sc.voiceover[:42]) if sc.voiceover else ""
         subf = (
-            [f"drawtext={f}fontcolor=0xE0D0FF:fontsize=48:borderw=2:bordercolor=black@0.3:"
+            [f"drawtext={f}fontcolor=0xE0D0FF:fontsize=42:borderw=2:bordercolor=black@0.3:"
              f"x=(w-text_w)/2:y=h*0.78:text='{sub}'"]
             if sub else []
         )
+        vf_base = [f"scale={w}:{h}"] + stars + title + subf
 
-        vf = [f"scale={w}:{h}"] + stars + badge + title + subf + ["format=yuv420p"]
-        await self._run([
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
-            "-t", str(sc.duration), "-vf", ",".join(vf), "-an",
-        ] + _SEG_ENCODE + [str(out)])
+        if self._badge_path:
+            bw, bh_val = 280, 56
+            bx = (w - bw) // 2
+            by = int(h * 0.07)
+            esc_badge = str(self._badge_path).replace("'", "\\'")
+            fc = (
+                f"[0:v]{','.join(vf_base)}[base];"
+                f"movie='{esc_badge}',scale={bw}:{bh_val},format=yuva420p[bdg];"
+                f"[base][bdg]overlay={bx}:{by},format=yuv420p[v]"
+            )
+            await self._run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
+                "-t", str(sc.duration),
+                "-filter_complex", fc, "-map", "[v]", "-an",
+            ] + _SEG_ENCODE + [str(out)])
+        else:
+            badge_f = self._badge_drawtext(f, h)
+            vf = vf_base + badge_f + ["format=yuv420p"]
+            await self._run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
+                "-t", str(sc.duration), "-vf", ",".join(vf), "-an",
+            ] + _SEG_ENCODE + [str(out)])
 
     async def _b_phone(self, sc, bg: Path, out: Path, hook: bool) -> None:
         w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
-        idx       = (sc.index - 1) % len(_B_BG)
-        bg_color  = self._b_bg_color(idx)
-        f         = self._fa()
+        idx      = (sc.index - 1) % len(_B_BG)
+        bg_color = self._b_bg_color(idx)
+        f        = self._fa()
 
         pw = int(w * 0.68); ph = int(h * 0.50)
         px = (w - pw) // 2; py = int(h * 0.24)
@@ -308,38 +424,50 @@ class FFmpegRenderer:
             f"drawbox=x={ix}:y={iy}:w={iw}:h={ih}:color=0x080818:t=fill",
             f"drawbox=x={(w-56)//2}:y={py+6}:w=56:h=14:color=0x0d0d1a:t=fill",
         ]
-        badge       = self._badge_drawtext(f, h)
-        sz          = 72 if hook else 64
-        tlines      = _wrap(sc.on_screen_text, 18)
-        tlh         = sz + 10
-        # tsy: размещаем заголовок НИЖЕ badge, не поверх него.
-        # badge занимает y=int(h*0.07)..+56px; добавляем зазор 10px.
-        _badge_bottom = int(h * 0.07) + 56 + 10   # ≈ 155px при h=1280
-        _phone_top    = py - 10                     # ≈ 297px
-        _zone_h       = _phone_top - _badge_bottom  # ≈ 142px
+        sz     = 70 if hook else 62
+        tlines = _wrap(sc.on_screen_text, 16)
+        tlh    = sz + 10
+        # Заголовок между badge и phone frame
+        _badge_bottom = int(h * 0.07) + 56 + 10
+        _zone_h       = py - 10 - _badge_bottom
         _block_h      = len(tlines) * tlh - 10
         tsy = _badge_bottom + max(0, (_zone_h - _block_h) // 2)
-        title       = [
+
+        title = [
             f"drawtext={f}fontcolor=white:fontsize={sz}:borderw=3:bordercolor=black@0.3:"
             f"x=(w-text_w)/2:y={tsy+i*tlh}:text='{_esc(l)}'"
             for i, l in enumerate(tlines)
         ]
-        sub  = _esc(sc.voiceover[:45]) if sc.voiceover else ""
+        sub  = _esc(sc.voiceover[:42]) if sc.voiceover else ""
         subf = (
-            [f"drawtext={f}fontcolor=0xE0D0FF:fontsize=44:borderw=2:bordercolor=black@0.3:"
+            [f"drawtext={f}fontcolor=0xE0D0FF:fontsize=40:borderw=2:bordercolor=black@0.3:"
              f"x=(w-text_w)/2:y=h*0.795:text='{sub}'"]
             if sub else []
         )
 
-        vf_bg = (
-            [f"scale={w}:{h}"] + stars + phone_frame + badge + title + subf + ["format=yuv420p"]
-        )
+        vf_bg_base = [f"scale={w}:{h}"] + stars + phone_frame + title + subf
 
-        filter_complex = (
-            f"[0:v]{','.join(vf_bg)}[bg];"
-            f"[1:v]scale={iw}:{ih},setsar=1,format=yuv420p[pv];"
-            f"[bg][pv]overlay={ix}:{iy}[v]"
-        )
+        if self._badge_path:
+            bw, bh_val = 280, 56
+            bx = (w - bw) // 2
+            by = int(h * 0.07)
+            esc_badge = str(self._badge_path).replace("'", "\\'")
+            filter_complex = (
+                f"[0:v]{','.join(vf_bg_base)}[bg_raw];"
+                f"movie='{esc_badge}',scale={bw}:{bh_val},format=yuva420p[bdg];"
+                f"[bg_raw][bdg]overlay={bx}:{by},format=yuv420p[bg];"
+                f"[1:v]scale={iw}:{ih},setsar=1,format=yuv420p[pv];"
+                f"[bg][pv]overlay={ix}:{iy}[v]"
+            )
+        else:
+            badge_f = self._badge_drawtext(f, h)
+            vf_bg = vf_bg_base + badge_f + ["format=yuv420p"]
+            filter_complex = (
+                f"[0:v]{','.join(vf_bg)}[bg];"
+                f"[1:v]scale={iw}:{ih},setsar=1,format=yuv420p[pv];"
+                f"[bg][pv]overlay={ix}:{iy}[v]"
+            )
+
         await self._run([
             "ffmpeg", "-y",
             "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
@@ -353,40 +481,54 @@ class FFmpegRenderer:
         ])
 
     async def _b_final(self, sc, out: Path) -> None:
+        """Fallback финальный слайд (если нет официального CTA видео)."""
         w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
         bg_color  = _B_BG[0][0]
         f         = self._fa()
         stars     = _stars(w, h, seed=99, count=18)
-        badge     = self._badge_drawtext(f, h)
-        # Лого-блок: иконка-щит + текст "Atlanta VPN" как единый горизонтальный блок.
-        # Общая ширина блока: icon(72) + gap(16) + text(~310) ≈ 398px → блок 400px.
-        # Центрируем весь блок: bx = (w - 400) // 2 = 160.
-        bx      = (w - 400) // 2          # 160
-        icon_cy = h // 2 - 80             # вертикальный центр иконки
-        icon_y  = icon_cy - 36            # верх квадрата 72px
-        text_y  = icon_cy - 35            # baseline текста ~вровень с иконкой
-        logo      = [
-            # Иконка-щит (синий квадрат)
+
+        bx      = (w - 400) // 2
+        icon_cy = h // 2 - 80
+        icon_y  = icon_cy - 36
+        text_y  = icon_cy - 35
+        logo = [
             f"drawbox=x={bx}:y={icon_y}:w=72:h=72:color=0x0055cc@0.92:t=fill",
-            # Буква «A» как символ внутри иконки
             f"drawtext={f}fontcolor=white:fontsize=48:borderw=2:bordercolor=0x003080@0.6:"
             f"x={bx+14}:y={icon_y+12}:text='A'",
-            # Текст «Atlanta VPN» справа от иконки
             f"drawtext={f}fontcolor=white:fontsize=64:borderw=3:bordercolor=0x003080@0.4:"
             f"x={bx+88}:y={text_y}:text='Atlanta VPN'",
         ]
         ct  = _esc(sc.on_screen_text)
         cta = [
-            # CTA под лого-блоком с зазором
             f"drawtext={f}fontcolor=0xD0C0FF:fontsize=50:borderw=2:bordercolor=black@0.3:"
             f"x=(w-text_w)/2:y=h*0.70:text='{ct}'"
         ]
-        vf = [f"scale={w}:{h}"] + stars + badge + logo + cta + ["format=yuv420p"]
-        await self._run([
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
-            "-t", str(sc.duration), "-vf", ",".join(vf), "-an",
-        ] + _SEG_ENCODE + [str(out)])
+        vf_base = [f"scale={w}:{h}"] + stars + logo + cta
+
+        if self._badge_path:
+            bw, bh_val = 280, 56
+            bx_b = (w - bw) // 2
+            by = int(h * 0.07)
+            esc_badge = str(self._badge_path).replace("'", "\\'")
+            fc = (
+                f"[0:v]{','.join(vf_base)}[base];"
+                f"movie='{esc_badge}',scale={bw}:{bh_val},format=yuva420p[bdg];"
+                f"[base][bdg]overlay={bx_b}:{by},format=yuv420p[v]"
+            )
+            await self._run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
+                "-t", str(sc.duration),
+                "-filter_complex", fc, "-map", "[v]", "-an",
+            ] + _SEG_ENCODE + [str(out)])
+        else:
+            badge_f = self._badge_drawtext(f, h)
+            vf = vf_base + badge_f + ["format=yuv420p"]
+            await self._run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
+                "-t", str(sc.duration), "-vf", ",".join(vf), "-an",
+            ] + _SEG_ENCODE + [str(out)])
 
     # ── Mix ───────────────────────────────────────────────────────────────────
 
@@ -415,7 +557,7 @@ class FFmpegRenderer:
         logger.info("ffmpeg: %s", " ".join(shlex.quote(p) for p in cmd))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.DEVNULL,   # stdout ffmpeg не нужен — только stderr
+            stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
@@ -445,19 +587,15 @@ class FFmpegRenderer:
 
 # ── Utils ─────────────────────────────────────────────────────────────────────
 
-def _hx(c: str) -> tuple[int, int, int]:
-    h = c[2:] if c.startswith("0x") else c.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
 def _esc(v: str) -> str:
     return (
         v.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
         .replace("%", "\\%").replace("\n", " ").replace("[", "\\[").replace("]", "\\]")
-    )[:72]
+    )[:68]  # чуть меньше чем раньше (было 72)
 
 
-def _wrap(text: str, n: int = 14) -> list[str]:
+def _wrap(text: str, n: int = 12) -> list[str]:
+    """Оборачивает текст по n символов — жёстче, нет обрезки справа."""
     words = text.split()
     lines: list[str] = []
     cur = ""
