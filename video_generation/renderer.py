@@ -1,17 +1,18 @@
 """
-FFmpegRenderer v6 — оптимизированный под Render 512MB / free tier timeout.
+FFmpegRenderer v7 — оптимизированный под Render 512MB / free tier.
 
-Ключевые оптимизации vs v5:
-  • geq (пиксельный, медленный) → colorchannelmixer для затемнения видео
-  • geq для планеты → убран, вместо него простой drawbox-эллипс (быстрый)
-  • geq для градиента B → заменён на scale+pad с solid-color bg (чистый цвет)
-  • badge overlay встроен в основной filtergraph через movie= source (0 доп. проходов)
-  • _a_solid: lavfi color градиент через несколько цветных overlay-полос (без geq)
-  • Итог: с ~90 сек/сцену → ~10-15 сек/сцену
+Изменения vs v6:
+  • -threads 1 во всех encode-командах    → нет параллельных потоков x264
+  • -preset ultrafast для сегментов       → минимальный lookahead-буфер (~30MB → ~5MB)
+  • -preset veryfast только в _mix        → сохраняем приемлемое качество финала
+  • stderr ограничен: proc.communicate()  → безопасный read без OOM
+  • cleanup сегментов после concat        → освобождаем FS после сборки
+  • _run принимает timeout=300            → защита от зависшего ffmpeg
 """
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import shlex
 from pathlib import Path
@@ -38,6 +39,14 @@ _B_BG = [
     ("0x2a0a70", "0x7c3aed"),
 ]
 
+# Флаги кодировщика для сегментов (RAM важнее качества промежуточных клипов)
+_SEG_ENCODE = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+               "-threads", "1", "-pix_fmt", "yuv420p"]
+
+# Флаги кодировщика для финального mix (качество важнее)
+_MIX_ENCODE = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+               "-threads", "1", "-pix_fmt", "yuv420p"]
+
 
 class FFmpegRenderer:
     def __init__(self, settings: Settings) -> None:
@@ -62,7 +71,6 @@ class FFmpegRenderer:
         subtitle_path = self.output_dir / f"{target.stem}.ass"
         write_ass(build_cues(script.scenes), subtitle_path)
 
-        # Кэшируем badge path один раз на всю генерацию
         try:
             self._badge_path = make_badge()
         except Exception:
@@ -85,7 +93,26 @@ class FFmpegRenderer:
         concat = self.output_dir / f"{target.stem}_concat.txt"
         concat.write_text("".join(f"file '{p.resolve()}'\n" for p in clips), encoding="utf-8")
         await self._mix(concat, voice_path, target)
+
+        # Cleanup: удаляем временные сегменты и concat-файл после финального mix
+        self._cleanup_segments(clips, concat)
+
         return target, subtitle_path
+
+    def _cleanup_segments(self, clips: list[Path], concat: Path) -> None:
+        """Удаляем временные сегменты после успешной сборки."""
+        for clip in clips:
+            try:
+                if clip.exists():
+                    clip.unlink()
+            except Exception as e:
+                logger.warning("Could not delete segment %s: %s", clip, e)
+        try:
+            if concat.exists():
+                concat.unlink()
+        except Exception as e:
+            logger.warning("Could not delete concat file: %s", e)
+        gc.collect()
 
     # ── Шаблон A ──────────────────────────────────────────────────────────────
 
@@ -99,15 +126,10 @@ class FFmpegRenderer:
                    if bg else
                    self._a_solid(sc, out, i == 0, i == n-1))
             clips.append(out)
+            gc.collect()  # освобождаем память после каждого сегмента
         return clips
 
     def _badge_filter(self, w: int, h: int) -> list[str]:
-        """
-        Встраивает badge.png в filtergraph через movie= source.
-        Возвращает 0 элементов если badge нет (fallback: текстовый бейдж).
-        ВАЖНО: работает только в -vf цепочке (не в filter_complex).
-        Для filter_complex используем отдельный input.
-        """
         if not self._badge_path:
             return []
         bw, bh = 320, 70
@@ -117,7 +139,6 @@ class FFmpegRenderer:
         return [f"movie='{esc_path}',scale={bw}:{bh}[badge];[in][badge]overlay={bx}:{by}[out]"]
 
     def _badge_drawtext(self, f: str, h: int) -> list[str]:
-        """Текстовый fallback для бейджа когда movie= недоступен."""
         by = int(h * 0.07)
         bw, bh_v = 280, 56
         return [
@@ -127,28 +148,18 @@ class FFmpegRenderer:
         ]
 
     async def _a_solid(self, sc, out: Path, hook: bool, cta: bool) -> None:
-        """
-        Тёмный фон без geq — используем lavfi color= с нужным цветом.
-        Планета — упрощённый ellipse через несколько drawbox (быстрее geq в 10x).
-        """
         w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
         idx        = (sc.index - 1) % len(_A_BG)
-        bg_color   = _A_BG[idx][0]   # тёмный цвет фона для lavfi
+        bg_color   = _A_BG[idx][0]
         f          = self._fa()
 
-        # Синяя планета — простые горизонтальные полосы (drawbox, не geq)
         planet = _planet_boxes(w, h)
-
-        # Сетка
         grid = (
             [f"drawbox=x=0:y={h*i//6}:w={w}:h=1:color=0x1a2a3a@0.2:t=fill" for i in range(1, 6)]
             + [f"drawbox=x={w*i//4}:y=0:w=1:h={h}:color=0x1a2a3a@0.2:t=fill" for i in range(1, 4)]
         )
-
-        # Бейдж (текстовый — movie= в -vf цепочке ненадёжен на Render)
         badge = self._badge_drawtext(f, h)
 
-        # Текст
         sz    = 86 if hook else 78
         yf    = 0.26 if hook else 0.30
         lines = _wrap(sc.on_screen_text.upper(), 14)
@@ -186,15 +197,10 @@ class FFmpegRenderer:
             "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
             "-t", str(sc.duration),
             "-vf", ",".join(vf),
-            "-an", str(out),
-        ])
+            "-an",
+        ] + _SEG_ENCODE + [str(out)])
 
     async def _a_video(self, sc, bg: Path, out: Path, hook: bool, cta: bool) -> None:
-        """
-        Pexels-видео как фон.
-        Затемнение: colorchannelmixer вместо geq (10x быстрее).
-        Badge встроен через отдельный input + filter_complex.
-        """
         w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
         f         = self._fa()
 
@@ -214,11 +220,8 @@ class FFmpegRenderer:
              f"x=(w-text_w)/2:y=h*0.68:text='{sub}'"]
             if sub else []
         )
-
-        # Badge через текстовый drawtext (надёжнее на Render)
         badge_f = self._badge_drawtext(f, h)
 
-        # colorchannelmixer для затемнения 0.30x: намного быстрее geq
         vf = (
             [f"scale={w}:{h},crop={w}:{h}:(iw-{w})/2:(ih-{h})/2",
              "colorchannelmixer=rr=0.30:gg=0.30:bb=0.38"]
@@ -231,8 +234,8 @@ class FFmpegRenderer:
             "-stream_loop", "-1", "-i", str(bg),
             "-t", str(sc.duration),
             "-vf", ",".join(vf),
-            "-an", "-r", str(fps), str(out),
-        ])
+            "-an", "-r", str(fps),
+        ] + _SEG_ENCODE + [str(out)])
 
     # ── Шаблон B ──────────────────────────────────────────────────────────────
 
@@ -249,14 +252,13 @@ class FFmpegRenderer:
             else:
                 await self._b_text(sc, out, i == 0)
             clips.append(out)
+            gc.collect()
         return clips
 
     def _b_bg_color(self, idx: int) -> str:
-        """Возвращает тёмный цвет фона для шаблона B (без geq)."""
         return _B_BG[idx][0]
 
     async def _b_text(self, sc, out: Path, hook: bool) -> None:
-        """Шаблон B без ассета: solid фиолетовый фон + текст + звёздочки."""
         w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
         idx       = (sc.index - 1) % len(_B_BG)
         bg_color  = self._b_bg_color(idx)
@@ -284,11 +286,10 @@ class FFmpegRenderer:
         await self._run([
             "ffmpeg", "-y",
             "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
-            "-t", str(sc.duration), "-vf", ",".join(vf), "-an", str(out),
-        ])
+            "-t", str(sc.duration), "-vf", ",".join(vf), "-an",
+        ] + _SEG_ENCODE + [str(out)])
 
     async def _b_phone(self, sc, bg: Path, out: Path, hook: bool) -> None:
-        """Шаблон B с ассетом: телефон-рамка + Pexels-видео внутри."""
         w, h, fps = self.settings.video_width, self.settings.video_height, self.settings.fps
         idx       = (sc.index - 1) % len(_B_BG)
         bg_color  = self._b_bg_color(idx)
@@ -339,7 +340,8 @@ class FFmpegRenderer:
             "-t", str(sc.duration),
             "-filter_complex", filter_complex,
             "-map", "[v]",
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-threads", "1",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
             "-an", str(out),
         ])
 
@@ -363,8 +365,8 @@ class FFmpegRenderer:
         await self._run([
             "ffmpeg", "-y",
             "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:r={fps}",
-            "-t", str(sc.duration), "-vf", ",".join(vf), "-an", str(out),
-        ])
+            "-t", str(sc.duration), "-vf", ",".join(vf), "-an",
+        ] + _SEG_ENCODE + [str(out)])
 
     # ── Mix ───────────────────────────────────────────────────────────────────
 
@@ -377,32 +379,31 @@ class FFmpegRenderer:
                 "-filter_complex", "[1:a]volume=1.0[a]",
                 "-map", "0:v", "-map", "[a]",
                 "-shortest",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-                str(target),
-            ]
+            ] + _MIX_ENCODE + ["-c:a", "aac", "-b:a", "128k", str(target)]
         else:
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0", "-i", str(concat),
                 "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                 "-shortest",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-                str(target),
-            ]
+            ] + _MIX_ENCODE + ["-c:a", "aac", "-b:a", "128k", str(target)]
         await self._run(cmd)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    async def _run(self, cmd: list[str]) -> None:
+    async def _run(self, cmd: list[str], timeout: int = 300) -> None:
         logger.info("ffmpeg: %s", " ".join(shlex.quote(p) for p in cmd))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,   # stdout ffmpeg не нужен — только stderr
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise RuntimeError(f"ffmpeg timed out after {timeout}s")
         if proc.returncode != 0:
             raise RuntimeError(stderr.decode("utf-8", errors="ignore")[-2000:])
 
@@ -466,19 +467,15 @@ def _stars(w: int, h: int, seed: int = 1, count: int = 10) -> list[str]:
 
 
 def _planet_boxes(w: int, h: int) -> list[str]:
-    """
-    Синяя планета через drawbox-полосы (без geq).
-    Рисуем ~15 горизонтальных полос разной ширины — намного быстрее geq.
-    """
     import math
     cx    = w // 2
     cy    = int(h * 0.82)
     rx    = int(w * 0.50)
     ry    = int(h * 0.20)
     boxes = []
-    steps = 15  # 15 полос вместо 274 — в 18 раз меньше операций
+    steps = 15
     for i in range(steps):
-        dy      = (i / (steps - 1)) * 2 - 1   # -1..1
+        dy      = (i / (steps - 1)) * 2 - 1
         xh      = int(rx * math.sqrt(max(0, 1 - dy ** 2)))
         py      = cy + int(dy * ry)
         if not (0 <= py < h):
