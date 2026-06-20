@@ -51,6 +51,11 @@ class ScriptGenerator:
     async def generate(self, topic: str | None = None) -> VideoScript:
         template = pick_template()
         used = await self.history.used_scripts(limit=20)
+        # v10: нормализуем topic один раз здесь — если это технический slug
+        # (template_id вроде "service_access"), переводим в читаемую фразу
+        # или сбрасываем в None. Иначе сырой slug может попасть и в промпт
+        # для Gemini, и в fallback-текст напрямую ("в service access твои данные").
+        topic = self._normalize_topic(topic)
         if not self.settings.gemini_api_key:
             return self._fallback_script(template, topic)
         prompt = self._build_prompt(template, topic, used)
@@ -64,6 +69,49 @@ class ScriptGenerator:
         except (aiohttp.ClientError, json.JSONDecodeError, ValidationError, KeyError, ValueError) as exc:
             logger.warning("Gemini generation failed, using fallback: %s", exc)
             return self._fallback_script(template, topic)
+
+    _TOPIC_SLUG_MAP = {
+        "digital_safety": "публичный Wi-Fi",
+        "gaming_ping": "пинг в играх",
+        "family_security": "безопасность семьи",
+        "privacy_story": "приватность в сети",
+        "work_remote": "удалённая работа",
+        "speed_test": "скорость интернета",
+        "blocked_news": "заблокированные сайты",
+        "public_wifi": "публичный Wi-Fi",
+        "travel_tip": "интернет в путешествии",
+        "subscription_save": "сервисы за рубежом",
+        "hidden_setting": "настройки смартфона",
+        "anti_tracking": "слежка в интернете",
+        "student_lifehack": "учёба онлайн",
+        "creator_stack": "работа контент-мейкера",
+        "weekly_checklist": "цифровая безопасность",
+        "browser_error": "ошибки браузера",
+        "three_sites": "полезные сайты",
+        "one_minute_setup": "быстрая настройка VPN",
+        "service_access": "доступ к сервисам за границей",
+        "geo_block": "гео-блокировки сайтов",
+        "streaming_unlock": "разблокировка стриминга",
+        "bank_security": "безопасность онлайн-банкинга",
+        "social_privacy": "приватность в соцсетях",
+    }
+
+    def _normalize_topic(self, topic: str | None) -> str | None:
+        """
+        Превращает технический slug (template_id-подобную строку без пробелов
+        и с подчёркиваниями) в человекочитаемую русскую фразу. Если slug
+        неизвестен — возвращает None вместо дословной замены "_" на " ",
+        чтобы не протащить английский технический термин в русский текст.
+        """
+        if not topic:
+            return topic
+        if "_" in topic and " " not in topic:
+            mapped = self._TOPIC_SLUG_MAP.get(topic)
+            if mapped:
+                return mapped
+            logger.warning("Unknown topic slug '%s', dropping to default subject", topic)
+            return None
+        return topic
 
     async def _generate_with_gemini(self, prompt: str) -> str:
         url = GEMINI_API_URL.format(model=self.settings.gemini_model)
@@ -177,30 +225,9 @@ class ScriptGenerator:
 
     def _fallback_script(self, template: VideoTemplate, topic: str | None) -> VideoScript:
         rng = SystemRandom()
-        # Если topic выглядит как template_id (нет пробелов, содержит _)
-        # — заменяем на человекочитаемую тему
-        _template_to_topic = {
-            "digital_safety": "публичный Wi-Fi",
-            "gaming_ping": "пинг в играх",
-            "family_security": "безопасность семьи",
-            "privacy_story": "приватность в сети",
-            "work_remote": "удалённая работа",
-            "speed_test": "скорость интернета",
-            "blocked_news": "заблокированные сайты",
-            "public_wifi": "публичный Wi-Fi",
-            "travel_tip": "интернет в путешествии",
-            "subscription_save": "сервисы за рубежом",
-            "hidden_setting": "настройки смартфона",
-            "anti_tracking": "слежка в интернете",
-            "student_lifehack": "учёба онлайн",
-            "creator_stack": "работа контент-мейкера",
-            "weekly_checklist": "цифровая безопасность",
-            "browser_error": "ошибки браузера",
-            "three_sites": "полезные сайты",
-            "one_minute_setup": "быстрая настройка VPN",
-        }
-        if topic and "_" in topic and " " not in topic:
-            topic = _template_to_topic.get(topic, topic.replace("_", " "))
+        # v10: topic уже нормализован в generate() через _normalize_topic()
+        # до вызова этого метода — здесь он либо человекочитаемая русская
+        # фраза, либо None. Дублирующий словарь-маппинг убран отсюда.
 
         subject = topic or rng.choice(
             ["публичный Wi-Fi", "потоковые сервисы", "приватность в сети", "работа за рубежом"]
