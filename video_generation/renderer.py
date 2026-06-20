@@ -217,7 +217,7 @@ class FFmpegRenderer:
         # badge и текст позиционируем ниже badge
         badge_bottom = int(h * 0.07) + 56 + 8   # ≈153
         max_text_w = w - 80  # поля по 40px с каждой стороны
-        start_sz = 82 if hook else 72
+        start_sz = 72 if hook else 64
         lines, sz = _wrap_to_fit(
             sc.on_screen_text.upper(), max_text_w, start_size=start_sz, min_size=44, max_lines=3
         )
@@ -229,12 +229,7 @@ class FFmpegRenderer:
             f"x=(w-text_w)/2:y={sy+i*lh}:text='{_esc(l)}'"
             for i, l in enumerate(lines)
         ]
-        sub = _esc(sc.voiceover[:42]) if sc.voiceover and not cta else ""
-        sub_f = (
-            [f"drawtext={f}fontcolor=0xB0C8E0:fontsize=40:borderw=2:bordercolor=black@0.5:"
-             f"x=(w-text_w)/2:y=h*0.71:text='{sub}'"]
-            if sub else []
-        )
+        sub_f = _build_subtitle_filters(f, sc.voiceover if not cta else None, w, 0.71)
         cta_f = []
         if cta:
             ct = _esc("Ссылка в описании")
@@ -280,9 +275,9 @@ class FFmpegRenderer:
 
         badge_bottom = int(h * 0.07) + 56 + 8
         max_text_w = w - 80
-        start_sz = 90 if hook else 80
+        start_sz = 76 if hook else 68
         lines, sz = _wrap_to_fit(
-            sc.on_screen_text.upper(), max_text_w, start_size=start_sz, min_size=44, max_lines=3
+            sc.on_screen_text.upper(), max_text_w, start_size=start_sz, min_size=42, max_lines=3
         )
         lh    = sz + 10
         sy    = badge_bottom + 16
@@ -292,12 +287,7 @@ class FFmpegRenderer:
             f"x=(w-text_w)/2:y={sy+i*lh}:text='{_esc(l)}'"
             for i, l in enumerate(lines)
         ]
-        sub = _esc(sc.voiceover[:42]) if sc.voiceover else ""
-        sub_f = (
-            [f"drawtext={f}fontcolor=0xB0C8E0:fontsize=40:borderw=3:bordercolor=black@0.5:"
-             f"x=(w-text_w)/2:y=h*0.71:text='{sub}'"]
-            if sub else []
-        )
+        sub_f = _build_subtitle_filters(f, sc.voiceover, w, 0.71)
 
         # v11: лёгкий Ken Burns zoom для динамики монтажа.
         # Масштабируем фон на 20% больше экрана и плавно "наезжаем"/"отъезжаем"
@@ -402,9 +392,9 @@ class FFmpegRenderer:
         stars    = _stars(w, h, sc.index)
 
         max_text_w = w - 80
-        start_sz = 90 if hook else 80
+        start_sz = 76 if hook else 68
         lines, sz = _wrap_to_fit(
-            sc.on_screen_text, max_text_w, start_size=start_sz, min_size=44, max_lines=3
+            sc.on_screen_text, max_text_w, start_size=start_sz, min_size=42, max_lines=3
         )
         lh    = sz + 14
         ty    = (h - len(lines) * lh) // 2 - 40
@@ -413,12 +403,7 @@ class FFmpegRenderer:
             f"x=(w-text_w)/2:y={ty+i*lh}:text='{_esc(l)}'"
             for i, l in enumerate(lines)
         ]
-        sub  = _esc(sc.voiceover[:42]) if sc.voiceover else ""
-        subf = (
-            [f"drawtext={f}fontcolor=0xE0D0FF:fontsize=42:borderw=2:bordercolor=black@0.3:"
-             f"x=(w-text_w)/2:y=h*0.78:text='{sub}'"]
-            if sub else []
-        )
+        subf = _build_subtitle_filters(f, sc.voiceover, w, 0.78, color="0xE0D0FF")
         vf_base = [f"scale={w}:{h}"] + stars + title + subf
 
         if self._badge_path:
@@ -465,9 +450,9 @@ class FFmpegRenderer:
             f"drawbox=x={(w-56)//2}:y={py+6}:w=56:h=14:color=0x0d0d1a:t=fill",
         ]
         max_text_w = w - 80
-        start_sz = 70 if hook else 62
+        start_sz = 62 if hook else 56
         tlines, sz = _wrap_to_fit(
-            sc.on_screen_text, max_text_w, start_size=start_sz, min_size=38, max_lines=3
+            sc.on_screen_text, max_text_w, start_size=start_sz, min_size=36, max_lines=3
         )
         tlh    = sz + 10
         # Заголовок между badge и phone frame
@@ -481,12 +466,7 @@ class FFmpegRenderer:
             f"x=(w-text_w)/2:y={tsy+i*tlh}:text='{_esc(l)}'"
             for i, l in enumerate(tlines)
         ]
-        sub  = _esc(sc.voiceover[:42]) if sc.voiceover else ""
-        subf = (
-            [f"drawtext={f}fontcolor=0xE0D0FF:fontsize=40:borderw=2:bordercolor=black@0.3:"
-             f"x=(w-text_w)/2:y=h*0.795:text='{sub}'"]
-            if sub else []
-        )
+        subf = _build_subtitle_filters(f, sc.voiceover, w, 0.795, color="0xE0D0FF")
 
         vf_bg_base = [f"scale={w}:{h}"] + stars + phone_frame + title + subf
 
@@ -738,6 +718,39 @@ def _text_width_px(text: str, size: int) -> int:
         return int(len(text) * size * 0.62)
     bbox = font.getbbox(text)
     return bbox[2] - bbox[0]
+
+
+def _build_subtitle_filters(
+    f: str,
+    voiceover: str | None,
+    w: int,
+    y_frac: float,
+    max_lines: int = 2,
+    start_size: int = 38,
+    min_size: int = 26,
+    color: str = "0xB0C8E0",
+) -> list[str]:
+    """
+    v12: субтитр (нижний текст со словами озвучки) теперь тоже измеряется
+    в реальных пикселях через _wrap_to_fit — раньше он обрезался жёстко
+    по символам (voiceover[:42]) с фиксированным fontsize=40, из-за чего
+    длинные слова или просто неудачные фразы вылезали за края экрана
+    с обеих сторон (та же проблема, что была у заголовков до v11).
+    Возвращает список drawtext-фильтров (1-2 строки), готовый к вставке
+    в vf-цепочку. y_frac — точка старта по вертикали (доля от h).
+    """
+    if not voiceover:
+        return []
+    max_w = w - 80
+    lines, sz = _wrap_to_fit(
+        voiceover, max_w, start_size=start_size, min_size=min_size, max_lines=max_lines
+    )
+    lh = sz + 8
+    return [
+        f"drawtext={f}fontcolor={color}:fontsize={sz}:borderw=2:bordercolor=black@0.5:"
+        f"x=(w-text_w)/2:y=h*{y_frac}+{i*lh}:text='{_esc(l)}'"
+        for i, l in enumerate(lines)
+    ]
 
 
 def _wrap_to_fit(
