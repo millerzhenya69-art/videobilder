@@ -47,9 +47,13 @@ _BRAND_ASSETS_DIR = Path(__file__).parent.parent / "brand_assets"
 _OFFICIAL_CTA_NAMES = ["IMG_5778.MP4", "img_5778.mp4", "cta_final.mp4", "official_cta.mp4"]
 
 _SEG_ENCODE = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-               "-threads", "1", "-pix_fmt", "yuv420p"]
-_MIX_ENCODE = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-               "-threads", "1", "-pix_fmt", "yuv420p"]
+               "-threads", "1", "-pix_fmt", "yuv420p", "-bufsize", "1500k", "-maxrate", "2000k"]
+# v10: mix переведён на ultrafast — на Render free-tier (512MB) именно финальный
+# concat+reencode+audio-mix шаг чаще всего убивает процесс по OOM, так как к этому
+# моменту уже накоплен мусор от 5 сегментов. veryfast давал чуть лучшую картинку,
+# но стабильность важнее на бесплатном плане.
+_MIX_ENCODE = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+               "-threads", "1", "-pix_fmt", "yuv420p", "-bufsize", "1500k", "-maxrate", "2500k"]
 
 # Путь к badge (ASCII, для ffmpeg movie= filter)
 _BADGE_TMP = Path("/tmp/atlanta_badge.png")
@@ -113,7 +117,15 @@ class FFmpegRenderer:
 
         concat = self.output_dir / f"{target.stem}_concat.txt"
         concat.write_text("".join(f"file '{p.resolve()}'\n" for p in clips), encoding="utf-8")
-        await self._mix(concat, voice_path, target)
+
+        # v10: явная пауза + сборка мусора перед самым тяжёлым шагом (mix).
+        # На Render free-tier (512MB) ОС нужно время чтобы реально освободить
+        # память от завершившихся ffmpeg-процессов сегментов, иначе mix
+        # стартует на уже частично занятой RAM и может схватить OOM.
+        gc.collect()
+        await asyncio.sleep(1.5)
+
+        await self._mix_with_retry(concat, voice_path, target)
         self._cleanup_segments(clips, concat)
         return target, subtitle_path
 
@@ -550,6 +562,45 @@ class FFmpegRenderer:
                 "-shortest",
             ] + _MIX_ENCODE + ["-c:a", "aac", "-b:a", "128k", str(target)]
         await self._run(cmd)
+
+    async def _mix_with_retry(self, concat: Path, voice: Path | None, target: Path) -> None:
+        """
+        v10: mix — самый тяжёлый шаг (concat + полный re-encode + audio).
+        Если первая попытка падает (OOM/timeout/crash), повторяем с более
+        лёгкими настройками: ниже битрейт и разрешение, без аудио-фильтра.
+        Это жертвует качеством только в худшем случае, а не всегда.
+        """
+        try:
+            await self._mix(concat, voice, target)
+            return
+        except Exception as e:
+            logger.warning("Mix attempt 1 failed (%s), retrying with lighter settings", e)
+
+        gc.collect()
+        await asyncio.sleep(2.0)
+
+        w, h = self.settings.video_width, self.settings.video_height
+        light_encode = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                         "-threads", "1", "-pix_fmt", "yuv420p",
+                         "-bufsize", "800k", "-maxrate", "1200k",
+                         "-vf", f"scale={w}:{h}"]
+        if voice and voice.exists():
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(concat),
+                "-i", str(voice),
+                "-map", "0:v", "-map", "1:a",
+                "-shortest",
+            ] + light_encode + ["-c:a", "aac", "-b:a", "96k", str(target)]
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(concat),
+                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-shortest",
+            ] + light_encode + ["-c:a", "aac", "-b:a", "96k", str(target)]
+        await self._run(cmd, timeout=240)
+        logger.info("Mix succeeded on retry with lighter settings")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
