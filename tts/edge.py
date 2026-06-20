@@ -1,10 +1,12 @@
 """
 Edge TTS с быстрым fallback на gTTS.
 
-Edge TTS на Render/Railway стабильно возвращает 403 — Microsoft закрыл
-публичный WSS endpoint для серверных IP. Делаем ровно 1 попытку (без
-многократных ретраев) и немедленно переходим на gTTS при любой ошибке.
-Это экономит ~8–14 секунд на каждой генерации.
+v11: главный фикс — pyproject.toml снял потолок версии edge-tts с "<7" на "<8".
+Версии 6.x генерировали Sec-MS-GEC токен по устаревшему алгоритму (или не
+генерировали вовсе), из-за чего Microsoft массово возвращал 403 на любых
+серверных IP. В 7.2+ добавлена корректная генерация токена с clock-skew
+correction — тот же механизм, что использует сам Edge-браузер.
+Голос по умолчанию — ru-RU-DmitryNeural (мужской), задаётся в settings.py.
 """
 
 import asyncio
@@ -24,16 +26,22 @@ class EdgeTTSProvider:
         pitch: str,
     ) -> Path:
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        # Одна попытка Edge TTS — если упадёт (403 с серверных IP),
-        # сразу идём в gTTS без ожиданий.
+        # Одна попытка Edge TTS — если упадёт, сразу идём в gTTS без ожиданий.
+        # timeout увеличен с 12 до 20с: на free-tier Render холодный старт
+        # сетевого стека иногда занимает больше времени, чем сам синтез.
         try:
             import edge_tts
             communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
-            await asyncio.wait_for(communicate.save(str(target_path)), timeout=12)
-            logger.info("Edge TTS success: %s", target_path.name)
-            return target_path
+            await asyncio.wait_for(communicate.save(str(target_path)), timeout=20)
+            if target_path.exists() and target_path.stat().st_size > 100:
+                logger.info("Edge TTS success: %s (voice=%s)", target_path.name, voice)
+                return target_path
+            logger.warning("Edge TTS produced empty/tiny file, using gTTS fallback")
         except Exception as exc:
-            logger.warning("Edge TTS failed (%s), using gTTS fallback", type(exc).__name__)
+            logger.warning(
+                "Edge TTS failed (%s: %s), using gTTS fallback",
+                type(exc).__name__, str(exc)[:150],
+            )
 
         await _gtts_fallback(text, target_path, voice)
         return target_path
